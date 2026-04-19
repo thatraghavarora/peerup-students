@@ -23,7 +23,7 @@ export function LandingScreen({ onNext, onSocialLogin }: LandingScreenProps) {
       const { data, error } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
-          redirectTo: window.location.origin
+          redirectTo: 'https://peerup-students.vercel.app/'
         }
       });
 
