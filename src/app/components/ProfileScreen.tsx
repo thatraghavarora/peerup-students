@@ -51,25 +51,45 @@ export function ProfileScreen({ onNext, phoneNumber, socialUser }: ProfileScreen
     if (isValid) {
       setLoading(true);
       try {
+        // Get user ID safely
+        let userId: string | null = null;
+        let userEmail: string | null = socialUser?.email || null;
+
+        const { data: { session } } = await supabase.auth.getSession();
+        if (session?.user) {
+          userId = session.user.id;
+          userEmail = session.user.email || userEmail;
+        } else {
+          const { data: { user } } = await supabase.auth.getUser();
+          if (user) {
+            userId = user.id;
+            userEmail = user.email || userEmail;
+          }
+        }
+
+        if (!userId) {
+          alert('Session expired. Please log in again.');
+          return;
+        }
+
         const { error } = await supabase
           .from('profiles')
-          .upsert(
-            {
-              id: socialUser?.id || (await supabase.auth.getUser()).data.user?.id,
-              full_name: name,
-              role: 'student',
-              gender: gender,
-              course_name: studentType === 'college' ? courseName : null,
-              semester: studentType === 'college' ? semester : null,
-              class_level: studentType === 'school' ? classLevel : null
-            }
-          );
+          .upsert({
+            id: userId,
+            full_name: name,
+            email: userEmail,
+            role: 'student',
+            gender: gender,
+            course_name: studentType === 'college' ? courseName : null,
+            semester: studentType === 'college' ? semester : null,
+            class_level: studentType === 'school' ? classLevel : null
+          });
 
         if (error) throw error;
         onNext(name);
-      } catch (error) {
-        console.error("Error saving profile:", error);
-        alert("Failed to save profile. Please try again.");
+      } catch (error: any) {
+        console.error('Error saving profile:', error);
+        alert('Failed to save profile: ' + (error.message || 'Please try again.'));
       } finally {
         setLoading(false);
       }

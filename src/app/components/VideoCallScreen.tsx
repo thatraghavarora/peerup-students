@@ -1,5 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
-import { PhoneOff, Mic, MicOff, Camera, CameraOff, MonitorUp, Send, MessageSquare, X, Clock, AlertTriangle, RefreshCcw, Wifi, WifiOff } from 'lucide-react';
+import {
+  PhoneOff, Mic, MicOff, Camera, CameraOff,
+  MonitorUp, MessageSquare, Clock, RefreshCcw, Loader2
+} from 'lucide-react';
 import { supabase } from '../../lib/supabase';
 
 interface VideoCallScreenProps {
@@ -9,355 +12,263 @@ interface VideoCallScreenProps {
   remoteName: string;
 }
 
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun3.l.google.com:19302' },
+  { urls: 'stun:stun4.l.google.com:19302' },
+  { urls: 'stun:stun.services.mozilla.com' },
+];
+
+// Student = OFFERER (always initiates)
+const IS_OFFERER = true;
+
 export function VideoCallScreen({ doubtId, currentUserId, onEnd, remoteName }: VideoCallScreenProps) {
   const [isMicOn, setIsMicOn] = useState(true);
   const [isCamOn, setIsCamOn] = useState(true);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
-  const [showChat, setShowChat] = useState(false);
-  const [messages, setMessages] = useState<any[]>([]);
-  const [newMessage, setNewMessage] = useState('');
   const [time, setTime] = useState(0);
-  const [mediaError, setMediaError] = useState<string | null>(null);
-  const [connStatus, setConnStatus] = useState('Booting WebRTC...');
-  
+  const [status, setStatus] = useState('Requesting camera...');
+  const [remoteStreamActive, setRemoteStreamActive] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
+
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
-  const peerConnection = useRef<RTCPeerConnection | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const signallingChannel = useRef<any>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const localStream = useRef<MediaStream | null>(null);
+  const sigChannel = useRef<any>(null);
   const iceCandidateQueue = useRef<RTCIceCandidateInit[]>([]);
-  const pingInterval = useRef<any>(null);
+  const offerSent = useRef(false);
 
-  // Identity: Student is Caller
-  const isCaller = true; 
+  const roomId = `webrtc_${(doubtId || 'default').toLowerCase()}`;
 
+  // Timer
   useEffect(() => {
-    const timer = setInterval(() => setTime(prev => prev + 1), 1000);
-    return () => clearInterval(timer);
+    const t = setInterval(() => setTime(s => s + 1), 1000);
+    return () => clearInterval(t);
   }, []);
 
-  const formatTime = (seconds: number) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  };
-
+  // Main setup
   useEffect(() => {
-    if (doubtId) {
-      initCall();
-    }
-    return () => {
-      cleanup();
-    };
-  }, [doubtId]);
+    let alive = true;
+    setup(alive);
+    return () => { alive = false; teardown(); };
+  }, [doubtId, retryCount]);
 
-  const cleanup = () => {
-    console.log("Cleaning up WebRTC...");
-    if (pingInterval.current) clearInterval(pingInterval.current);
-    streamRef.current?.getTracks().forEach(track => track.stop());
-    if (peerConnection.current) {
-        peerConnection.current.close();
-        peerConnection.current = null;
-    }
-    if (signallingChannel.current) {
-        supabase.removeChannel(signallingChannel.current);
-    }
-  };
+  const setup = async (alive: boolean) => {
+    offerSent.current = false;
+    iceCandidateQueue.current = [];
+    setRemoteStreamActive(false);
+    setStatus('Requesting camera...');
 
-  const initCall = async () => {
+    // 1. Get media
+    let stream: MediaStream;
     try {
-      setConnStatus("Accessing Media Devices...");
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { width: 1280, height: 720 }, 
-        audio: true 
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 1280 } },
+        audio: { echoCancellation: true, noiseSuppression: true }
       });
-      streamRef.current = stream;
-      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-      setConnStatus("Media Ready. Creating Peer...");
-      setupWebRTC(stream);
-    } catch (err: any) {
-      console.error("Camera fail:", err);
-      setMediaError("Using Audio Fallback");
-      const audioOnly = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
-      if (audioOnly) {
-          streamRef.current = audioOnly;
-          setupWebRTC(audioOnly);
-      } else {
-          setConnStatus("Media Error");
-          setMediaError("Blocked: Mic access required.");
-          // Still try to connect data
-          setupWebRTC(new MediaStream());
+    } catch {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        setStatus('Audio only (no camera)');
+      } catch {
+        setStatus('❌ Camera/mic blocked. Allow permissions and retry.');
+        return;
       }
     }
-  };
+    if (!alive) { stream.getTracks().forEach(t => t.stop()); return; }
+    localStream.current = stream;
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = stream;
+      localVideoRef.current.play().catch(() => {});
+    }
 
-  const setupWebRTC = (stream: MediaStream) => {
-    const pc = new RTCPeerConnection({
-        iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:stun2.l.google.com:19302' },
-            { urls: 'stun:stun3.l.google.com:19302' },
-            { urls: 'stun:stun4.l.google.com:19302' }
-        ]
-    });
-    peerConnection.current = pc;
+    // 2. Create PeerConnection (don't add tracks yet!)
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS, iceCandidatePoolSize: 10 });
+    pcRef.current = pc;
 
-    stream.getTracks().forEach(track => pc.addTrack(track, stream));
-
-    pc.ontrack = (event) => {
-      console.log("Remote view received");
-      setConnStatus("Live Connection");
-      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = event.streams[0];
+    pc.onicecandidate = ({ candidate }) => {
+      if (!candidate) return;
+      sigChannel.current?.send({
+        type: 'broadcast', event: 'ice',
+        payload: { candidate: candidate.toJSON(), from: currentUserId }
+      });
     };
 
     pc.oniceconnectionstatechange = () => {
-        setConnStatus(`Status: ${pc.iceConnectionState}`);
-        if (pc.iceConnectionState === 'disconnected') setConnStatus("Reconnecting...");
-    };
-
-    // Use a unique but consistent channel per doubt
-    const channel = supabase.channel(`webrtc_v5_${doubtId}`);
-    signallingChannel.current = channel;
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        channel.send({
-          type: 'broadcast',
-          event: 'candidate',
-          payload: { candidate: event.candidate, senderId: currentUserId }
-        });
+      console.log('[Student] ICE:', pc.iceConnectionState);
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        setStatus('✅ Connected');
+      } else if (pc.iceConnectionState === 'failed') {
+        setStatus('Connection failed — retrying ICE...');
+        pc.restartIce();
+      } else if (pc.iceConnectionState === 'checking') {
+        setStatus('Connecting...');
       }
     };
 
-    const processIceQueue = async () => {
-        while (iceCandidateQueue.current.length > 0) {
-            const cand = iceCandidateQueue.current.shift();
-            if (cand && pc.remoteDescription) {
-               await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(e => console.warn(e));
+    pc.ontrack = ({ streams }) => {
+      console.log('[Student] Remote track received');
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = streams[0];
+        remoteVideoRef.current.play().catch(console.warn);
+      }
+      setRemoteStreamActive(true);
+      setStatus('✅ Connected');
+    };
+
+    // 3. Subscribe to signaling channel FIRST, then add tracks
+    const ch = supabase.channel(roomId);
+    sigChannel.current = ch;
+
+    ch
+      .on('broadcast', { event: 'answer' }, async ({ payload }) => {
+        if (payload.from === currentUserId) return;
+        console.log('[Student] Received answer');
+        try {
+          if (pc.signalingState === 'have-local-offer') {
+            await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+            // flush ICE queue
+            for (const c of iceCandidateQueue.current) {
+              await pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.warn);
             }
+            iceCandidateQueue.current = [];
+          }
+        } catch (e) { console.error('[Student] Answer error:', e); }
+      })
+      .on('broadcast', { event: 'ice' }, async ({ payload }) => {
+        if (payload.from === currentUserId) return;
+        if (pc.remoteDescription) {
+          await pc.addIceCandidate(new RTCIceCandidate(payload.candidate)).catch(console.warn);
+        } else {
+          iceCandidateQueue.current.push(payload.candidate);
         }
-    };
+      })
+      .subscribe(async (status) => {
+        if (status !== 'SUBSCRIBED' || !alive) return;
+        setStatus('Waiting for tutor...');
 
-    const handleOffer = async (offer: any) => {
-        console.log("Offer received");
-        await pc.setRemoteDescription(new RTCSessionDescription(offer));
-        await processIceQueue();
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        channel.send({
-            type: 'broadcast',
-            event: 'answer',
-            payload: { answer, senderId: currentUserId }
+        // 4. NOW add tracks (after channel is ready)
+        localStream.current!.getTracks().forEach(track => {
+          pc.addTrack(track, localStream.current!);
         });
-    };
 
-    const handleAnswer = async (answer: any) => {
-        console.log("Answer received");
-        await pc.setRemoteDescription(new RTCSessionDescription(answer));
-        await processIceQueue();
-    };
-
-    channel
-      .on('broadcast', { event: 'ping' }, () => {
-          console.log("Peer discovered");
-          if (isCaller) {
-              pc.createOffer().then(offer => {
-                  pc.setLocalDescription(offer);
-                  channel.send({ type: 'broadcast', event: 'offer', payload: { offer, senderId: currentUserId }});
-              });
-          } else {
-              channel.send({ type: 'broadcast', event: 'pong', payload: { senderId: currentUserId } });
-          }
-      })
-      .on('broadcast', { event: 'pong' }, () => {
-          if (isCaller) {
-              pc.createOffer().then(offer => {
-                  pc.setLocalDescription(offer);
-                  channel.send({ type: 'broadcast', event: 'offer', payload: { offer, senderId: currentUserId }});
-              });
-          }
-      })
-      .on('broadcast', { event: 'offer' }, ({ payload }) => {
-        if (payload.senderId !== currentUserId) handleOffer(payload.offer);
-      })
-      .on('broadcast', { event: 'answer' }, ({ payload }) => {
-        if (payload.senderId !== currentUserId) handleAnswer(payload.answer);
-      })
-      .on('broadcast', { event: 'candidate' }, ({ payload }) => {
-        if (payload.senderId !== currentUserId) {
-          if (pc.remoteDescription) {
-             pc.addIceCandidate(new RTCIceCandidate(payload.candidate)).catch(e => console.warn(e));
-          } else {
-             iceCandidateQueue.current.push(payload.candidate);
-          }
+        // 5. Create and send offer
+        try {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          offerSent.current = true;
+          console.log('[Student] Sending offer...');
+          ch.send({
+            type: 'broadcast', event: 'offer',
+            payload: { sdp: pc.localDescription, from: currentUserId }
+          });
+          setStatus('Offer sent — waiting for tutor...');
+        } catch (e) {
+          console.error('[Student] Offer error:', e);
+          setStatus('❌ Failed to create offer');
         }
-      })
-      .subscribe((status) => {
-          if (status === 'SUBSCRIBED') {
-              console.log("Signal Ready");
-              setConnStatus("Scanning for Peer...");
-              // Aggressive Pinging
-              pingInterval.current = setInterval(() => {
-                  channel.send({ type: 'broadcast', event: 'ping', payload: { senderId: currentUserId } });
-              }, 3000);
-          }
       });
   };
 
-  const handleRetry = () => {
-    cleanup();
-    initCall();
+  const teardown = () => {
+    localStream.current?.getTracks().forEach(t => t.stop());
+    localStream.current = null;
+    pcRef.current?.close();
+    pcRef.current = null;
+    if (sigChannel.current) { supabase.removeChannel(sigChannel.current); sigChannel.current = null; }
   };
+
+  const toggleMic = () => { localStream.current?.getAudioTracks().forEach(t => { t.enabled = !t.enabled; }); setIsMicOn(p => !p); };
+  const toggleCam = () => { localStream.current?.getVideoTracks().forEach(t => { t.enabled = !t.enabled; }); setIsCamOn(p => !p); };
 
   const handleScreenShare = async () => {
-    if (!isScreenSharing) {
+    if (isScreenSharing) {
       try {
-        console.log("Launching Screen Share...");
-        const screenStream = await navigator.mediaDevices.getDisplayMedia({ 
-            video: { 
-                height: { ideal: 1080 },
-                frameRate: { ideal: 15 }
-            },
-            audio: false 
-        });
-        
-        const screenTrack = screenStream.getVideoTracks()[0];
-        const sender = peerConnection.current?.getSenders().find(s => s.track?.kind === 'video');
-        
-        if (sender) {
-            sender.replaceTrack(screenTrack).catch(e => console.error(e));
-        }
-        
-        if (localVideoRef.current) {
-            localVideoRef.current.srcObject = screenStream;
-            localVideoRef.current.style.objectFit = 'contain'; // Better for screen text
-        }
-        
-        setIsScreenSharing(true);
-        setConnStatus("Presenting Screen");
-
-        screenTrack.onended = () => {
-          console.log("Screen share ended via system");
-          resetCamera();
-        };
-      } catch (err) {
-        console.error("Screen share fail:", err);
-      }
+        const cam = await navigator.mediaDevices.getUserMedia({ video: true });
+        const sender = pcRef.current?.getSenders().find(s => s.track?.kind === 'video');
+        if (sender) await sender.replaceTrack(cam.getVideoTracks()[0]);
+        if (localVideoRef.current) localVideoRef.current.srcObject = localStream.current;
+        setIsScreenSharing(false);
+      } catch (e) { console.error(e); }
     } else {
-      resetCamera();
+      try {
+        const screen = await (navigator.mediaDevices as any).getDisplayMedia({ video: true, audio: true });
+        const sender = pcRef.current?.getSenders().find(s => s.track?.kind === 'video');
+        if (sender) await sender.replaceTrack(screen.getVideoTracks()[0]);
+        if (localVideoRef.current) localVideoRef.current.srcObject = screen;
+        setIsScreenSharing(true);
+        screen.getVideoTracks()[0].onended = () => handleScreenShare();
+      } catch (e) { console.error(e); }
     }
   };
 
-  const resetCamera = async () => {
-    try {
-        const stream = await navigator.mediaDevices.getUserMedia({ 
-            video: { width: 1280, height: 720 }, 
-            audio: true 
-        });
-        const videoTrack = stream.getVideoTracks()[0];
-        const sender = peerConnection.current?.getSenders().find(s => s.track?.kind === 'video');
-        
-        if (sender) {
-            sender.replaceTrack(videoTrack).catch(e => console.error(e));
-        }
-        
-        if (localVideoRef.current) {
-            localVideoRef.current.srcObject = stream;
-            localVideoRef.current.style.objectFit = 'cover';
-        }
-        
-        setIsScreenSharing(false);
-        setConnStatus("Live Connection");
-    } catch (e) {
-        console.error(e);
-        setIsScreenSharing(false);
-    }
-  };
+  const fmt = (s: number) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 
   return (
-    <div className="h-full bg-slate-950 flex flex-col relative overflow-hidden font-sans">
-      {/* HUD Info */}
-      <div className="absolute top-6 left-0 right-0 z-30 flex flex-col items-center gap-2 pointer-events-none">
-        <div className="bg-white/10 backdrop-blur-3xl border border-white/20 px-5 py-2 rounded-2xl flex items-center gap-4 shadow-2xl pointer-events-auto">
-          <div className="flex items-center gap-2">
-             <div className="w-2 h-2 rounded-full bg-red-600 animate-pulse" />
-             <span className="text-[9px] font-black uppercase tracking-widest text-white/70">Session ID: {doubtId?.slice(0, 8)}</span>
-          </div>
-          <div className="w-px h-4 bg-white/20" />
-          <div className="flex items-center gap-2">
-            <Clock className="w-4 h-4 text-sky-400" />
-            <span className="font-mono font-bold text-lg text-white">{formatTime(time)}</span>
-          </div>
+    <div className="absolute inset-0 bg-slate-950 flex flex-col overflow-hidden text-white z-[100]">
+      {/* HUD */}
+      <div className="absolute top-0 left-0 right-0 z-50 px-4 pt-4 flex justify-between items-center pointer-events-none">
+        <div className="bg-black/70 backdrop-blur-md border border-white/10 px-3 py-2 rounded-2xl pointer-events-auto max-w-[60%]">
+          <span className="text-[10px] font-black uppercase tracking-widest text-white/70 truncate block">{status}</span>
         </div>
-        <div className="bg-black/60 px-4 py-1.5 rounded-full border border-white/5 shadow-inner pointer-events-auto">
-            <div className="flex items-center gap-2">
-               {connStatus.includes('Connected') || connStatus.includes('Live') ? <Wifi className="w-3 h-3 text-green-400" /> : <WifiOff className="w-3 h-3 text-red-400 animate-pulse" />}
-               <p className="text-[9px] font-black text-white uppercase tracking-widest">{connStatus}</p>
-            </div>
+        <div className="bg-black/70 backdrop-blur-md border border-white/10 px-3 py-2 rounded-2xl flex items-center gap-1.5 pointer-events-auto">
+          <Clock className="w-3 h-3 text-blue-400" />
+          <span className="font-mono text-xs font-black">{fmt(time)}</span>
         </div>
       </div>
 
-      {/* Main Remote View */}
+      {/* Remote video */}
       <div className="flex-1 relative bg-slate-900 overflow-hidden">
-        <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-contain" />
-        {!remoteVideoRef.current?.srcObject && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/90 transition-all">
-             <div className="w-28 h-28 bg-sky-600/10 rounded-full flex items-center justify-center text-5xl font-black mb-6 animate-pulse border-2 border-sky-500/20 shadow-[0_0_50px_rgba(14,165,233,0.1)]">
-                {remoteName?.charAt(0)}
-             </div>
-             <h3 className="text-2xl font-black text-white tracking-tight">{remoteName}</h3>
-             <p className="text-[10px] text-sky-400 font-black uppercase tracking-[0.4em] mt-4 opacity-70">Handshaking Secure Link...</p>
-             <div className="mt-12 flex flex-col items-center gap-4">
-                <button onClick={handleRetry} className="bg-white/5 border border-white/10 px-6 py-3 rounded-2xl flex items-center gap-3 transition-all hover:bg-white/10 hover:border-white/30 group">
-                   <RefreshCcw className="w-4 h-4 text-white/40 group-hover:rotate-180 transition-transform duration-500" />
-                   <span className="text-xs font-black uppercase text-white/60">Force Recalibrate</span>
-                </button>
-             </div>
+        <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-cover"
+          onClick={() => remoteVideoRef.current?.play()} />
+
+        {!remoteStreamActive && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950">
+            <div className="w-20 h-20 rounded-full bg-blue-600/20 border-2 border-blue-400/30 flex items-center justify-center text-3xl font-black mb-6 animate-pulse">
+              {(remoteName || 'T').charAt(0).toUpperCase()}
+            </div>
+            <p className="text-lg font-black mb-2">{remoteName || 'Expert'}</p>
+            <div className="flex items-center gap-2 text-slate-400">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              <span className="text-xs uppercase tracking-widest">{status}</span>
+            </div>
+            <button onClick={() => setRetryCount(c => c + 1)}
+              className="mt-8 bg-blue-600 px-5 py-2.5 rounded-xl font-black text-sm flex items-center gap-2 active:scale-95">
+              <RefreshCcw className="w-3.5 h-3.5" /> Retry
+            </button>
           </div>
         )}
+
+        {/* Local PiP */}
+        <div className="absolute bottom-4 right-4 w-24 h-36 rounded-2xl overflow-hidden border border-white/10 bg-slate-800 shadow-2xl z-20">
+          <video ref={localVideoRef} autoPlay muted playsInline className={`w-full h-full object-cover ${!isCamOn && 'opacity-0'}`} />
+          {!isCamOn && <div className="absolute inset-0 flex items-center justify-center"><CameraOff className="w-5 h-5 text-white/20" /></div>}
+        </div>
       </div>
 
-      {/* Local Preview */}
-      <div className="absolute top-8 right-6 w-36 h-48 bg-slate-800 rounded-3xl border border-white/20 overflow-hidden shadow-2xl z-20 group transition-all">
-         <video ref={localVideoRef} autoPlay muted playsInline className={`w-full h-full object-cover transition-opacity duration-700 ${!isCamOn ? 'opacity-0' : 'opacity-100'}`} />
-         {!isCamOn && (
-           <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-900 text-white/20 gap-2">
-             <CameraOff className="w-7 h-7" />
-             <span className="text-[8px] font-black uppercase tracking-widest">Privacy On</span>
-           </div>
-         )}
-         {mediaError && (
-            <div className="absolute top-2 left-2 right-2 bg-red-600/90 text-white text-[8px] px-2 py-1 rounded-lg font-black uppercase text-center animate-bounce">
-                {mediaError}
-            </div>
-         )}
-      </div>
-
-      {/* Control Bar */}
-      <div className="absolute bottom-12 left-0 right-0 z-40 px-8 flex justify-center">
-        <div className="bg-black/80 backdrop-blur-3xl border border-white/10 p-5 rounded-[3.5rem] flex items-center gap-6 shadow-[0_32px_128px_-16px_rgba(0,0,0,1)]">
-          <div className="flex gap-4 border-r border-white/10 pr-6">
-            <button onClick={() => { setIsMicOn(!isMicOn); streamRef.current?.getAudioTracks().forEach(t => t.enabled = !isMicOn); }} className={`w-14 h-14 rounded-full flex items-center justify-center transition-all ${isMicOn ? 'bg-white/5 text-white' : 'bg-red-600 text-white'}`}>
-              {isMicOn ? <Mic className="w-6 h-6" /> : <MicOff className="w-6 h-6" />}
-            </button>
-            <button onClick={() => { setIsCamOn(!isCamOn); streamRef.current?.getVideoTracks().forEach(t => t.enabled = !isCamOn); }} className={`w-14 h-14 rounded-full flex items-center justify-center transition-all ${isCamOn ? 'bg-white/5 text-white' : 'bg-red-600 text-white'}`}>
-              {isCamOn ? <Camera className="w-6 h-6" /> : <CameraOff className="w-6 h-6" />}
-            </button>
-          </div>
-
-          <button onClick={onEnd} className="w-20 h-20 bg-red-600 rounded-full flex items-center justify-center text-white shadow-2xl border-4 border-slate-950 hover:scale-110 active:scale-90 transition-all">
-            <PhoneOff className="w-10 h-10" />
+      {/* Controls */}
+      <div className="bg-black/60 backdrop-blur-xl px-6 py-6 flex justify-center items-center gap-3 border-t border-white/5">
+        <div className="flex items-center gap-2 bg-white/5 p-2 rounded-2xl">
+          <button onClick={toggleMic} className={`w-12 h-12 rounded-xl flex items-center justify-center transition-all active:scale-90 ${isMicOn ? 'bg-white/10' : 'bg-red-600'}`}>
+            {isMicOn ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
           </button>
-
-          <div className="flex gap-4 border-l border-white/10 pl-6">
-            <button onClick={handleScreenShare} className={`w-14 h-14 rounded-full flex items-center justify-center transition-all ${isScreenSharing ? 'bg-sky-600 text-white' : 'bg-white/5 text-white'}`}>
-              <MonitorUp className="w-6 h-6" />
-            </button>
-            <button onClick={() => setShowChat(!showChat)} className={`w-14 h-14 rounded-full flex items-center justify-center transition-all ${showChat ? 'bg-white text-slate-950' : 'bg-white/5 text-white'}`}>
-              <MessageSquare className="w-6 h-6" />
-            </button>
-          </div>
+          <button onClick={toggleCam} className={`w-12 h-12 rounded-xl flex items-center justify-center transition-all active:scale-90 ${isCamOn ? 'bg-white/10' : 'bg-red-600'}`}>
+            {isCamOn ? <Camera className="w-5 h-5" /> : <CameraOff className="w-5 h-5" />}
+          </button>
+        </div>
+        <button onClick={onEnd} className="w-14 h-14 bg-red-600 rounded-full flex items-center justify-center shadow-2xl hover:scale-110 active:scale-90 transition-all">
+          <PhoneOff className="w-6 h-6" />
+        </button>
+        <div className="flex items-center gap-2 bg-white/5 p-2 rounded-2xl">
+          <button onClick={handleScreenShare} className={`w-12 h-12 rounded-xl flex items-center justify-center transition-all active:scale-90 ${isScreenSharing ? 'bg-blue-600' : 'bg-white/10'}`}>
+            <MonitorUp className="w-5 h-5" />
+          </button>
+          <button className="w-12 h-12 rounded-xl flex items-center justify-center bg-white/10 transition-all active:scale-90">
+            <MessageSquare className="w-5 h-5" />
+          </button>
         </div>
       </div>
     </div>

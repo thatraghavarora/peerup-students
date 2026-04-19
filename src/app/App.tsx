@@ -13,16 +13,14 @@ export default function App() {
   const [socialUser, setSocialUser] = useState<any>(null);
 
   useEffect(() => {
-    // 1. Initial Session Check
     const checkSession = async () => {
       const { data: { session } } = await supabase.auth.getSession();
       if (session) handleUser(session.user);
     };
     checkSession();
 
-    // 2. Listen for auth state changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
-      console.log("Auth event:", event);
+      console.log('Auth event:', event);
       if (session) {
         handleUser(session.user);
       } else if (event === 'SIGNED_OUT') {
@@ -32,14 +30,11 @@ export default function App() {
       }
     });
 
-    return () => {
-      subscription.unsubscribe();
-    };
+    return () => { subscription.unsubscribe(); };
   }, []);
 
   const handleUser = async (user: any) => {
     setSocialUser(user);
-    // Fetch profile
     const { data: profile } = await supabase
       .from('profiles')
       .select('*')
@@ -55,8 +50,8 @@ export default function App() {
   };
 
   return (
-    <div className="h-screen w-screen flex items-center justify-center bg-gray-100 overflow-hidden">
-      <div className="w-full max-w-[390px] h-full sm:h-[844px] bg-white shadow-xl flex flex-col relative overflow-hidden">
+    <div className="h-screen w-screen bg-slate-950 flex items-center justify-center overflow-hidden">
+      <div className="w-full max-w-[430px] h-full bg-white flex flex-col relative overflow-hidden shadow-2xl">
         {currentScreen === 'landing' && (
           <LandingScreen
             onNext={(phone, result) => {
