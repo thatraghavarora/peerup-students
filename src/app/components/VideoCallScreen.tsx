@@ -21,88 +21,99 @@ const ICE_SERVERS = [
   { urls: 'stun:stun.services.mozilla.com' },
 ];
 
-// Student = OFFERER (always initiates)
-const IS_OFFERER = true;
-
+// Student = OFFERER
 export function VideoCallScreen({ doubtId, currentUserId, onEnd, remoteName }: VideoCallScreenProps) {
-  const [isMicOn, setIsMicOn] = useState(true);
-  const [isCamOn, setIsCamOn] = useState(true);
+  const [isMicOn, setIsMicOn]             = useState(true);
+  const [isCamOn, setIsCamOn]             = useState(true);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
-  const [time, setTime] = useState(0);
-  const [status, setStatus] = useState('Requesting camera...');
+  const [time, setTime]                   = useState(0);
+  const [status, setStatus]               = useState('Starting camera...');
   const [remoteStreamActive, setRemoteStreamActive] = useState(false);
-  const [retryCount, setRetryCount] = useState(0);
+  const [retryCount, setRetryCount]       = useState(0);
 
-  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const localVideoRef  = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
-  const pcRef = useRef<RTCPeerConnection | null>(null);
-  const localStream = useRef<MediaStream | null>(null);
-  const sigChannel = useRef<any>(null);
-  const iceCandidateQueue = useRef<RTCIceCandidateInit[]>([]);
-  const offerSent = useRef(false);
+  const pcRef          = useRef<RTCPeerConnection | null>(null);
+  const localStream    = useRef<MediaStream | null>(null);
+  const screenStream   = useRef<MediaStream | null>(null);
+  const sigChannel     = useRef<any>(null);
+
+  // Store ICE candidates gathered BEFORE tutor joins so we can replay them
+  const gatheredIce    = useRef<RTCIceCandidateInit[]>([]);
+  // Queue of remote ICE candidates received before remoteDescription is set
+  const pendingIce     = useRef<RTCIceCandidateInit[]>([]);
 
   const roomId = `webrtc_${(doubtId || 'default').toLowerCase()}`;
 
-  // Timer
+  // ── Timer ──────────────────────────────────────────────────────────────────
   useEffect(() => {
     const t = setInterval(() => setTime(s => s + 1), 1000);
     return () => clearInterval(t);
   }, []);
 
-  // Main setup
+  // ── Main setup / tear-down ─────────────────────────────────────────────────
   useEffect(() => {
     let alive = true;
-    setup(alive);
-    return () => { alive = false; teardown(); };
+    init(alive);
+    return () => { alive = false; cleanup(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [doubtId, retryCount]);
 
-  const setup = async (alive: boolean) => {
-    offerSent.current = false;
-    iceCandidateQueue.current = [];
+  // ── Init ───────────────────────────────────────────────────────────────────
+  const init = async (alive: boolean) => {
+    gatheredIce.current  = [];
+    pendingIce.current   = [];
     setRemoteStreamActive(false);
-    setStatus('Requesting camera...');
+    setStatus('Starting camera...');
 
-    // 1. Get media
+    // 1. Acquire local media
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'user', width: { ideal: 1280 } },
-        audio: { echoCancellation: true, noiseSuppression: true }
+        audio: { echoCancellation: true, noiseSuppression: true },
       });
     } catch {
       try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        setStatus('Audio only (no camera)');
+        setStatus('Audio only — no camera found');
       } catch {
-        setStatus('❌ Camera/mic blocked. Allow permissions and retry.');
+        setStatus('❌ Camera/mic blocked. Allow permissions & retry.');
         return;
       }
     }
     if (!alive) { stream.getTracks().forEach(t => t.stop()); return; }
+
     localStream.current = stream;
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = stream;
       localVideoRef.current.play().catch(() => {});
     }
 
-    // 2. Create PeerConnection (don't add tracks yet!)
+    // 2. Create PeerConnection
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS, iceCandidatePoolSize: 10 });
     pcRef.current = pc;
 
+    // Add local tracks so they appear in the offer SDP
+    stream.getTracks().forEach(track => pc.addTrack(track, stream));
+
+    // Collect ICE candidates as they arrive AND cache them for replay
     pc.onicecandidate = ({ candidate }) => {
       if (!candidate) return;
+      const json = candidate.toJSON();
+      gatheredIce.current.push(json);         // cache for re-send on request-offer
       sigChannel.current?.send({
         type: 'broadcast', event: 'ice',
-        payload: { candidate: candidate.toJSON(), from: currentUserId }
+        payload: { candidate: json, from: currentUserId },
       });
     };
 
     pc.oniceconnectionstatechange = () => {
-      console.log('[Student] ICE:', pc.iceConnectionState);
+      console.log('[Student] ICE state:', pc.iceConnectionState);
       if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
         setStatus('✅ Connected');
       } else if (pc.iceConnectionState === 'failed') {
-        setStatus('Connection failed — retrying ICE...');
+        setStatus('Retrying ICE...');
         pc.restartIce();
       } else if (pc.iceConnectionState === 'checking') {
         setStatus('Connecting...');
@@ -119,61 +130,92 @@ export function VideoCallScreen({ doubtId, currentUserId, onEnd, remoteName }: V
       setStatus('✅ Connected');
     };
 
-    // 3. Subscribe to signaling channel FIRST, then add tracks
+    // 3. Signaling channel
     const ch = supabase.channel(roomId);
     sigChannel.current = ch;
 
     ch
-      .on('broadcast', { event: 'answer' }, async ({ payload }) => {
+      // ── Answer from tutor ─────────────────────────────────────────────────
+      .on('broadcast', { event: 'answer' }, async ({ payload }: any) => {
         if (payload.from === currentUserId) return;
-        console.log('[Student] Received answer');
+        console.log('[Student] Got answer, sigState:', pc.signalingState);
+        if (pc.signalingState !== 'have-local-offer') return; // already processed
         try {
-          if (pc.signalingState === 'have-local-offer') {
-            await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-            // flush ICE queue
-            for (const c of iceCandidateQueue.current) {
-              await pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.warn);
-            }
-            iceCandidateQueue.current = [];
+          await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+          // Flush any queued remote ICE candidates
+          for (const c of pendingIce.current) {
+            await pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.warn);
           }
-        } catch (e) { console.error('[Student] Answer error:', e); }
+          pendingIce.current = [];
+        } catch (e) { console.error('[Student] setRemoteDescription error:', e); }
       })
-      .on('broadcast', { event: 'ice' }, async ({ payload }) => {
+
+      // ── Remote ICE ────────────────────────────────────────────────────────
+      .on('broadcast', { event: 'ice' }, async ({ payload }: any) => {
         if (payload.from === currentUserId) return;
         if (pc.remoteDescription) {
           await pc.addIceCandidate(new RTCIceCandidate(payload.candidate)).catch(console.warn);
         } else {
-          iceCandidateQueue.current.push(payload.candidate);
+          pendingIce.current.push(payload.candidate);
         }
       })
-      .subscribe(async (status) => {
-        if (status !== 'SUBSCRIBED' || !alive) return;
-        setStatus('Waiting for tutor...');
 
-        // 4. NOW add tracks (after channel is ready)
-        localStream.current!.getTracks().forEach(track => {
-          pc.addTrack(track, localStream.current!);
-        });
+      // ── Tutor joined late — replay existing offer + all ICE ───────────────
+      .on('broadcast', { event: 'request-offer' }, async ({ payload }: any) => {
+        if (payload.from === currentUserId) return;
+        console.log('[Student] Tutor requested offer, state:', pc.signalingState);
 
-        // 5. Create and send offer
-        try {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          offerSent.current = true;
-          console.log('[Student] Sending offer...');
-          ch.send({
+        if (pc.localDescription) {
+          // ✅ KEY FIX: just re-broadcast the EXISTING local description — no createOffer()
+          console.log('[Student] Re-sending existing offer SDP');
+          await ch.send({
             type: 'broadcast', event: 'offer',
-            payload: { sdp: pc.localDescription, from: currentUserId }
+            payload: { sdp: pc.localDescription, from: currentUserId },
           });
-          setStatus('Offer sent — waiting for tutor...');
-        } catch (e) {
-          console.error('[Student] Offer error:', e);
-          setStatus('❌ Failed to create offer');
+          // Replay all gathered ICE candidates so tutor doesn't miss any
+          for (const c of gatheredIce.current) {
+            await ch.send({
+              type: 'broadcast', event: 'ice',
+              payload: { candidate: c, from: currentUserId },
+            });
+          }
+          setStatus('Offer re-sent — waiting for tutor...');
+        } else {
+          // Offer hasn't been created yet, create it now
+          await createAndSendOffer(pc, ch);
         }
+      })
+
+      // ── Channel ready ─────────────────────────────────────────────────────
+      .subscribe(async (subStatus: string) => {
+        if (subStatus !== 'SUBSCRIBED' || !alive) return;
+        setStatus('Waiting for tutor...');
+        await createAndSendOffer(pc, ch);
       });
   };
 
-  const teardown = () => {
+  // ── Create offer (only called once from subscribe or when no localDescription) ──
+  const createAndSendOffer = async (pc: RTCPeerConnection, ch: any) => {
+    try {
+      console.log('[Student] Creating offer...');
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await ch.send({
+        type: 'broadcast', event: 'offer',
+        payload: { sdp: pc.localDescription, from: currentUserId },
+      });
+      setStatus('Offer sent — waiting for tutor...');
+      console.log('[Student] Offer sent');
+    } catch (e) {
+      console.error('[Student] createOffer error:', e);
+      setStatus('❌ Failed to create offer');
+    }
+  };
+
+  // ── Teardown ───────────────────────────────────────────────────────────────
+  const cleanup = () => {
+    screenStream.current?.getTracks().forEach(t => t.stop());
+    screenStream.current = null;
     localStream.current?.getTracks().forEach(t => t.stop());
     localStream.current = null;
     pcRef.current?.close();
@@ -181,32 +223,55 @@ export function VideoCallScreen({ doubtId, currentUserId, onEnd, remoteName }: V
     if (sigChannel.current) { supabase.removeChannel(sigChannel.current); sigChannel.current = null; }
   };
 
-  const toggleMic = () => { localStream.current?.getAudioTracks().forEach(t => { t.enabled = !t.enabled; }); setIsMicOn(p => !p); };
-  const toggleCam = () => { localStream.current?.getVideoTracks().forEach(t => { t.enabled = !t.enabled; }); setIsCamOn(p => !p); };
+  // ── Controls ───────────────────────────────────────────────────────────────
+  const toggleMic = () => {
+    localStream.current?.getAudioTracks().forEach(t => { t.enabled = !t.enabled; });
+    setIsMicOn(p => !p);
+  };
+
+  const toggleCam = () => {
+    if (!localStream.current) return;
+    localStream.current.getVideoTracks().forEach(t => { t.enabled = !t.enabled; });
+    setIsCamOn(prev => {
+      const next = !prev;
+      if (!isScreenSharing && localVideoRef.current) {
+        localVideoRef.current.srcObject = next ? localStream.current : null;
+      }
+      return next;
+    });
+  };
 
   const handleScreenShare = async () => {
+    const pc = pcRef.current;
+    if (!pc) return;
+
     if (isScreenSharing) {
       try {
-        const cam = await navigator.mediaDevices.getUserMedia({ video: true });
-        const sender = pcRef.current?.getSenders().find(s => s.track?.kind === 'video');
-        if (sender) await sender.replaceTrack(cam.getVideoTracks()[0]);
+        const camTrack = localStream.current?.getVideoTracks()[0];
+        const sender   = pc.getSenders().find(s => s.track?.kind === 'video');
+        if (sender && camTrack) await sender.replaceTrack(camTrack);
+        screenStream.current?.getTracks().forEach(t => t.stop());
+        screenStream.current = null;
         if (localVideoRef.current) localVideoRef.current.srcObject = localStream.current;
         setIsScreenSharing(false);
-      } catch (e) { console.error(e); }
+      } catch (e) { console.error('[Student] Stop screen share error:', e); }
     } else {
       try {
-        const screen = await (navigator.mediaDevices as any).getDisplayMedia({ video: true, audio: true });
-        const sender = pcRef.current?.getSenders().find(s => s.track?.kind === 'video');
-        if (sender) await sender.replaceTrack(screen.getVideoTracks()[0]);
+        const screen = await (navigator.mediaDevices as any).getDisplayMedia({ video: { cursor: 'always' }, audio: true });
+        screenStream.current = screen;
+        const screenTrack = screen.getVideoTracks()[0];
+        const sender = pc.getSenders().find(s => s.track?.kind === 'video');
+        if (sender) await sender.replaceTrack(screenTrack);
         if (localVideoRef.current) localVideoRef.current.srcObject = screen;
         setIsScreenSharing(true);
-        screen.getVideoTracks()[0].onended = () => handleScreenShare();
-      } catch (e) { console.error(e); }
+        screenTrack.onended = () => handleScreenShare();
+      } catch (e) { console.error('[Student] Screen share error:', e); }
     }
   };
 
   const fmt = (s: number) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 
+  // ── UI ─────────────────────────────────────────────────────────────────────
   return (
     <div className="absolute inset-0 bg-slate-950 flex flex-col overflow-hidden text-white z-[100]">
       {/* HUD */}
@@ -244,8 +309,9 @@ export function VideoCallScreen({ doubtId, currentUserId, onEnd, remoteName }: V
 
         {/* Local PiP */}
         <div className="absolute bottom-4 right-4 w-24 h-36 rounded-2xl overflow-hidden border border-white/10 bg-slate-800 shadow-2xl z-20">
-          <video ref={localVideoRef} autoPlay muted playsInline className={`w-full h-full object-cover ${!isCamOn && 'opacity-0'}`} />
-          {!isCamOn && <div className="absolute inset-0 flex items-center justify-center"><CameraOff className="w-5 h-5 text-white/20" /></div>}
+          <video ref={localVideoRef} autoPlay muted playsInline className={`w-full h-full object-cover ${!isCamOn && !isScreenSharing && 'opacity-0'}`} />
+          {!isCamOn && !isScreenSharing && <div className="absolute inset-0 flex items-center justify-center"><CameraOff className="w-5 h-5 text-white/20" /></div>}
+          {isScreenSharing && <div className="absolute bottom-1 left-0 right-0 text-center text-[9px] font-black text-blue-300 bg-blue-950/80 py-0.5">SCREEN</div>}
         </div>
       </div>
 
